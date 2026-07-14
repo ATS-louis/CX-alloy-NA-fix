@@ -2,8 +2,11 @@
 """
 app.py — Web front-end for cxalloy_na_fix.py
 
-Upload CxAlloy TQ test-report PDFs, get back corrected versions
-(NA-valued ticks converted to N/A badges, header stats recalculated).
+Upload CxAlloy TQ test-report PDFs (single tests or concatenated
+multi-test exports) and get back corrected versions: NA-valued ticks
+converted to N/A badges with each test's header percentages and
+progress bars recalculated independently, and the CTA modification
+note added to every page footer.
 
 Stateless by design: the corrected PDF is returned in the same request
 (base64 in JSON for the in-page flow, or directly as a file for the
@@ -13,6 +16,8 @@ correctly across multiple gunicorn workers, instances, and restarts.
 Environment:
     APP_PASSWORD   optional — if set, uploads require this password
     MAX_MB         optional — upload size cap in MB (default 25)
+    WORKERS        optional — analysis worker processes for large
+                   concatenated exports (default: auto)
 
 Run locally:      python3 app.py            (http://localhost:8000)
 Run in prod:      gunicorn -b 0.0.0.0:$PORT -w 2 --timeout 120 app:app
@@ -26,38 +31,25 @@ import fitz
 from flask import Flask, jsonify, render_template_string, request, send_file
 from werkzeug.utils import secure_filename
 
-from cxalloy_na_fix import (collect_targets, fix_bars, fix_header_text,
-                            flip_badges, na_glyph_png, pct_string)
+from cxalloy_na_fix import apply_plans, plan_document
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("MAX_MB", 25)) * 1024 * 1024
 PASSWORD = os.environ.get("APP_PASSWORD", "")
+WORKERS = int(os.environ["WORKERS"]) if os.environ.get("WORKERS") else None
 
 
 def process_pdf(data: bytes):
-    """Run the correction. Returns (out_bytes_or_None, summary_dict)."""
+    """Run the per-test correction. Returns (out_bytes_or_None, tests)."""
     doc = fitz.open(stream=data, filetype="pdf")
-    targets, counts = collect_targets(doc)
-    before = dict(counts)
-    if not targets:
-        doc.close()
-        return None, {"before": before, "after": before, "lines": [], "header": None}
-    new_p = counts["passed"] - len(targets)
-    new_f = counts["failed"]
-    new_n = counts["na"] + len(targets)
-    header, _ = pct_string(new_p, new_f, new_n)
-    total = new_p + new_f + new_n
-    flip_badges(doc, targets, na_glyph_png(doc))
-    fix_header_text(doc, header)
-    fix_bars(doc, new_p / total, new_f / total)
-    out = doc.tobytes(garbage=3, deflate=True)
+    plans = plan_document(doc, workers=WORKERS)
+    changed = apply_plans(doc, plans)
+    out = doc.tobytes(garbage=3, deflate=True) if changed else None
     doc.close()
-    return out, {
-        "before": before,
-        "after": {"passed": new_p, "failed": new_f, "na": new_n},
-        "lines": [t[2] for t in targets],
-        "header": header,
-    }
+    tests = [{k: p[k] for k in ("label", "pages", "before", "after",
+                                "header", "lines", "changed")}
+             for p in plans]
+    return out, tests
 
 
 def handle_upload():
@@ -69,12 +61,13 @@ def handle_upload():
         return {"ok": False, "error": "Not a .pdf file."}, 400
     stem = secure_filename(f.filename)[:-4] or "report"
     try:
-        out, summary = process_pdf(f.read())
+        out, tests = process_pdf(f.read())
     except Exception:
         return {"ok": False,
                 "error": "Could not read this file as a CxAlloy report PDF."}, 400
     payload = {"ok": True, "changed": out is not None,
-               "filename": f"{stem}_corrected.pdf", **summary}
+               "filename": f"{stem}_corrected.pdf", "tests": tests,
+               "converted": sum(len(t["lines"]) for t in tests)}
     if out is not None:
         payload["pdf"] = base64.b64encode(out).decode("ascii")
     return payload, 200
@@ -93,8 +86,8 @@ def direct():
     if not payload["ok"]:
         return payload["error"], status
     if not payload["changed"]:
-        return ("No NA-valued Passed lines found — this report needs no "
-                "correction. Go back and choose another file."), 200
+        return ("No NA-valued Passed lines found in any test — this report "
+                "needs no correction. Go back and choose another file."), 200
     data = base64.b64decode(payload["pdf"])
     return send_file(io.BytesIO(data), as_attachment=True,
                      download_name=payload["filename"],
@@ -117,7 +110,7 @@ PAGE = r"""<!doctype html>
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--ink);
        font:15px/1.5 "Segoe UI",system-ui,-apple-system,Arial,sans-serif}
-  main{max-width:660px;margin:0 auto;padding:40px 20px 64px}
+  main{max-width:680px;margin:0 auto;padding:40px 20px 64px}
 
   /* header */
   .brand{display:flex;align-items:center;gap:10px;margin-bottom:6px}
@@ -126,7 +119,7 @@ PAGE = r"""<!doctype html>
   .b-g{background:var(--green)} .b-n{background:var(--grey)}
   .arrow{color:var(--mut);font-size:18px}
   h1{font-size:21px;margin:0;letter-spacing:.2px}
-  .sub{color:var(--mut);font-size:13.5px;margin:0 0 26px;max-width:52ch}
+  .sub{color:var(--mut);font-size:13.5px;margin:0 0 26px;max-width:56ch}
 
   /* dropzone */
   .drop{display:block;border:2px dashed #b9bdb9;border-radius:6px;background:var(--card);
@@ -144,24 +137,33 @@ PAGE = r"""<!doctype html>
                background:#fff;font:inherit}
   .pwrow input:focus-visible{outline:3px solid var(--ink);outline-offset:1px}
 
-  /* results */
+  /* result cards */
   #results{margin-top:22px;display:flex;flex-direction:column;gap:12px}
   .row{background:var(--card);border:1px solid var(--rule);border-radius:6px;padding:16px 18px}
   .row-top{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
   .fname{font-weight:600;font-size:14px;word-break:break-all;flex:1;min-width:40%}
-  .chip{font:700 10.5px/1 Arial;letter-spacing:.6px;color:#fff;padding:5px 9px;border-radius:3px}
+  .chip{font:700 10.5px/1 Arial;letter-spacing:.6px;color:#fff;padding:5px 9px;border-radius:3px;
+        white-space:nowrap}
   .c-fix{background:var(--green)} .c-none{background:var(--grey)}
   .c-err{background:var(--red)} .c-busy{background:#9aa09a}
-  .bar{display:flex;height:10px;border-radius:5px;overflow:hidden;background:var(--dark);
-       margin:13px 0 7px}
+
+  /* per-test blocks inside a card */
+  .test{border-top:1px solid var(--rule);margin-top:12px;padding-top:11px}
+  .t-top{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+  .t-label{font:700 13px var(--mono)}
+  .t-pages{color:var(--mut);font-size:11.5px}
+  .chip.sm{font-size:9.5px;padding:4px 7px;margin-left:auto}
+  .bar{display:flex;height:9px;border-radius:5px;overflow:hidden;background:var(--dark);
+       margin:10px 0 6px}
   .bar i{display:block;height:100%}
   .bar .p{background:var(--green)} .bar .f{background:var(--red)}
   @media (prefers-reduced-motion:no-preference){.bar i{transition:width .8s ease}}
-  .stats{font-family:var(--mono);font-size:12.5px;color:var(--mut);margin:0}
+  .stats{font-family:var(--mono);font-size:12px;color:var(--mut);margin:0}
   .stats b{color:var(--ink);font-weight:600}
-  .lines{margin:9px 0 0;font-size:12.5px;color:var(--mut)}
+  .lines{margin:8px 0 0;font-size:12.5px;color:var(--mut)}
   .lines .ln{display:inline-block;background:var(--grey);color:#fff;border-radius:3px;
              font:700 10px/1 Arial;padding:3px 5px;margin:2px 3px 0 0}
+  .note{margin:12px 0 0;font-size:12px;color:var(--mut);font-style:italic}
   .dl{display:inline-block;margin-top:13px;padding:9px 22px;background:var(--green);color:#fff;
       border-radius:4px;text-decoration:none;font-weight:600;font-size:14px}
   .dl:hover{background:var(--green-dk)}
@@ -177,9 +179,11 @@ PAGE = r"""<!doctype html>
   <span class="badge b-g">&check;</span><span class="arrow">&rarr;</span>
   <span class="badge b-n">NA</span><h1>CxAlloy N/A Fixer</h1>
 </div>
-<p class="sub">Drop in exported test reports. Passed lines answered &ldquo;NA&rdquo; become
-N/A badges, header percentages and progress bars are recalculated, and photo links and
-signatures are preserved.</p>
+<p class="sub">Drop in exported test reports &mdash; single tests or concatenated
+multi-test exports. Each test is corrected independently: Passed lines answered
+&ldquo;NA&rdquo; become N/A badges, that test&rsquo;s header percentages and progress
+bars are recalculated, and photo links and signatures are preserved. A CTA
+modification note is added to every page footer.</p>
 
 <form id="form">
   <label class="drop" id="drop">
@@ -223,9 +227,10 @@ verify converted line numbers against CxAlloy before issuing.</p>
   var queue = Promise.resolve();
 
   function pct(n, total){ return total ? Math.round(n/total*100) : 0; }
+  function total(st){ return st.passed + st.failed + st.na; }
 
   function barHTML(st){
-    var t = st.passed + st.failed + st.na;
+    var t = total(st);
     return '<div class="bar" aria-hidden="true">'
          + '<i class="p" style="width:' + pct(st.passed,t) + '%"></i>'
          + '<i class="f" style="width:' + pct(st.failed,t) + '%"></i></div>';
@@ -246,8 +251,36 @@ verify converted line numbers against CxAlloy before issuing.</p>
     return row;
   }
 
+  function testBlock(t){
+    var div = document.createElement('div');
+    div.className = 'test';
+    var head = '<div class="t-top"><span class="t-label"></span>'
+             + '<span class="t-pages">pages ' + t.pages[0] + '&ndash;' + t.pages[1] + '</span>'
+             + (t.changed
+                ? '<span class="chip sm c-fix">' + t.lines.length + ' LINE'
+                  + (t.lines.length>1?'S':'') + ' FIXED</span>'
+                : '<span class="chip sm c-none">NO CHANGE</span>')
+             + '</div>';
+    div.innerHTML = head + barHTML(t.before);
+    div.querySelector('.t-label').textContent = t.label;
+
+    var s = document.createElement('p'); s.className = 'stats';
+    s.innerHTML = t.changed
+      ? statLine('Before:', t.before) + '<br>'
+        + statLine('After:&nbsp;', t.after) + ' &mdash; <b>' + t.header + '</b>'
+      : statLine('Unchanged:', t.before);
+    div.appendChild(s);
+
+    if (t.changed && t.lines.length){
+      var ln = document.createElement('p'); ln.className = 'lines';
+      ln.innerHTML = 'Converted lines: ' + t.lines.map(function(n){
+        return '<span class="ln">' + n + '</span>'; }).join('');
+      div.appendChild(ln);
+    }
+    return div;
+  }
+
   function renderDone(row, d){
-    var top = row.querySelector('.row-top');
     var chip = row.querySelector('.chip');
     if (!d.ok){
       chip.className = 'chip c-err'; chip.textContent = 'ERROR';
@@ -255,41 +288,41 @@ verify converted line numbers against CxAlloy before issuing.</p>
       e.textContent = d.error || 'Something went wrong.';
       row.appendChild(e); return;
     }
+    var nTests = d.tests.length;
     if (!d.changed){
       chip.className = 'chip c-none'; chip.textContent = 'NO CHANGE';
-      var p = document.createElement('p'); p.className = 'stats';
-      p.innerHTML = statLine('Already correct:', d.before);
-      row.appendChild(p); return;
+    } else {
+      chip.className = 'chip c-fix';
+      chip.textContent = d.converted + ' LINE' + (d.converted>1?'S':'')
+                       + (nTests>1 ? ' FIXED IN ' + nTests + ' TESTS' : ' FIXED');
     }
-    chip.className = 'chip c-fix';
-    chip.textContent = d.lines.length + ' LINE' + (d.lines.length>1?'S':'') + ' FIXED';
+    d.tests.forEach(function(t){ row.appendChild(testBlock(t)); });
 
-    row.insertAdjacentHTML('beforeend', barHTML(d.before));
-    var s = document.createElement('p'); s.className = 'stats';
-    s.innerHTML = statLine('Before:', d.before) + '<br>'
-                + statLine('After:&nbsp;', d.after) + ' &mdash; <b>' + d.header + '</b>';
-    row.appendChild(s);
+    if (d.changed){
+      var note = document.createElement('p'); note.className = 'note';
+      note.textContent = 'CTA modification note added to every page footer.';
+      row.appendChild(note);
 
-    var ln = document.createElement('p'); ln.className = 'lines';
-    ln.innerHTML = 'Converted lines: ' + d.lines.map(function(n){
-      return '<span class="ln">' + n + '</span>'; }).join('');
-    row.appendChild(ln);
+      var bytes = atob(d.pdf), arr = new Uint8Array(bytes.length);
+      for (var i=0;i<bytes.length;i++) arr[i] = bytes.charCodeAt(i);
+      var url = URL.createObjectURL(new Blob([arr], {type:'application/pdf'}));
+      var a = document.createElement('a');
+      a.className = 'dl'; a.href = url; a.download = d.filename;
+      a.textContent = 'Download ' + d.filename;
+      row.appendChild(a);
 
-    var bytes = atob(d.pdf), arr = new Uint8Array(bytes.length);
-    for (var i=0;i<bytes.length;i++) arr[i] = bytes.charCodeAt(i);
-    var url = URL.createObjectURL(new Blob([arr], {type:'application/pdf'}));
-    var a = document.createElement('a');
-    a.className = 'dl'; a.href = url; a.download = d.filename;
-    a.textContent = 'Download ' + d.filename;
-    row.appendChild(a);
-
-    // animate the bar from the old split to the new one
-    requestAnimationFrame(function(){ requestAnimationFrame(function(){
-      var t = d.after.passed + d.after.failed + d.after.na;
-      var segs = row.querySelectorAll('.bar i');
-      segs[0].style.width = pct(d.after.passed,t) + '%';
-      segs[1].style.width = pct(d.after.failed,t) + '%';
-    });});
+      // animate each changed test's bar from its old split to the new one
+      requestAnimationFrame(function(){ requestAnimationFrame(function(){
+        var blocks = row.querySelectorAll('.test');
+        d.tests.forEach(function(t, i){
+          if (!t.changed) return;
+          var segs = blocks[i].querySelectorAll('.bar i');
+          var tt = total(t.after);
+          segs[0].style.width = pct(t.after.passed,tt) + '%';
+          segs[1].style.width = pct(t.after.failed,tt) + '%';
+        });
+      });});
+    }
   }
 
   function processFile(file){
