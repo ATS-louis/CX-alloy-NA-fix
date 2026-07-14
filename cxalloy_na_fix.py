@@ -66,8 +66,7 @@ CORNER_R = 1.5 / 12                    # badge corner radius (fraction)
 NA_TOKENS = {"na", "n/a", "n.a.", "n.a"}
 HEADER_Y, FOOTER_Y = 48, 744           # running header/footer exclusion
 
-FOOTER_NOTE = ("This CxAlloy report has been modified to meet "
-               "CTA reporting requirements.")
+FOOTER_NOTE = ("Post-Processing Notice: This report was originally generated from CxAlloy and has been post-processed, reformatted, and modified to meet CTA reporting requirements.")
 
 PCT_RE = re.compile(r"^\d+% Passed \| \d+% Failed \| \d+% N/A$")
 LABEL_RE = re.compile(r"^#\d+$")
