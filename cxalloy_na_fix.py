@@ -409,8 +409,11 @@ def add_footer_note(doc, note=FOOTER_NOTE):
     """Right-align the modification note on each page's footer baseline.
 
     Uses the footer's own font size and colour so the note reads as part
-    of the template. If a page's footer is unusually wide the note
-    shrinks (never below 6pt) and, as a last resort, drops one line.
+    of the template. A note too long for the space right of the existing
+    footer text wraps — splitting only at spaces — onto two or at most
+    three right-aligned lines flowing down from the baseline. Only if
+    even three lines cannot hold it does the font shrink (never below
+    6pt) as a last resort.
     """
     for pno in range(doc.page_count):
         page = doc[pno]
@@ -421,24 +424,45 @@ def add_footer_note(doc, note=FOOTER_NOTE):
             f = foot[0]
             size, color = f["size"], _int_to_rgb(f["color"])
             y, left = f["origin"][1], f["bbox"][0]
-            occupied = max(s["bbox"][2] for s in spans
-                           if abs(s["origin"][1] - y) < 1)
+            occupied = max((s["bbox"][2] for s in spans
+                            if abs(s["origin"][1] - y) < 1), default=0)
         else:  # footerless page: sit where the footer would be
             size, color = 8.25, _int_to_rgb(0x333333)
             y, left, occupied = page.rect.height - 46.4, 48.2, 0
         right = page.rect.width - left
-        fs = size
-        while (fs > 6.0 and
-               fitz.get_text_length(note, fontname="helv", fontsize=fs)
-               > right - occupied - 12):
-            fs -= 0.25
-        w = fitz.get_text_length(note, fontname="helv", fontsize=fs)
-        if right - w < occupied + 12:            # still colliding: own line
-            fs = size
-            w = fitz.get_text_length(note, fontname="helv", fontsize=fs)
-            y = min(y + size + 1.5, page.rect.height - 6)
-        page.insert_text((right - w, y), note, fontname="helv",
-                         fontsize=fs, color=color)
+        max_w = right - occupied - 12        # clear the footer text + a gap
+
+        def wrap(fs):
+            """Greedy space-only wrap into lines of width <= max_w.
+            Returns None if any single word alone overflows at `fs`."""
+            lines, cur = [], ""
+            for word in note.split():
+                cand = (cur + " " + word).strip()
+                if fitz.get_text_length(cand, fontname="helv",
+                                        fontsize=fs) <= max_w:
+                    cur = cand
+                    continue
+                if not cur or fitz.get_text_length(
+                        word, fontname="helv", fontsize=fs) > max_w:
+                    return None              # a lone word can't fit
+                lines.append(cur)
+                cur = word
+            return lines + [cur] if cur else lines
+
+        fs, lines = size, wrap(size)
+        while (lines is None or len(lines) > 3) and fs > 6.0:
+            fs -= 0.25                       # last resort: shrink to fit
+            lines = wrap(fs)
+        if not lines:                        # unsplittable even at 6pt:
+            lines = [note]                   # place at the shrunk size
+        lh = fs * 1.2
+        # anchor on the footer baseline; if the block would run off the
+        # page bottom, lift the whole block just enough to fit
+        start_y = min(y, page.rect.height - 4 - (len(lines) - 1) * lh)
+        for i, line in enumerate(lines):
+            w = fitz.get_text_length(line, fontname="helv", fontsize=fs)
+            page.insert_text((right - w, start_y + i * lh), line,
+                             fontname="helv", fontsize=fs, color=color)
 
 
 def apply_plans(doc, plans):
