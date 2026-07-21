@@ -34,7 +34,7 @@ from werkzeug.utils import secure_filename
 from cxalloy_na_fix import apply_plans, plan_document
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("MAX_MB", 25)) * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("MAX_MB", 125)) * 1024 * 1024
 PASSWORD = os.environ.get("APP_PASSWORD", "")
 WORKERS = int(os.environ["WORKERS"]) if os.environ.get("WORKERS") else None
 
@@ -189,7 +189,7 @@ modification note is added to every page footer.</p>
   <label class="drop" id="drop">
     <input class="sr" type="file" id="file" accept="application/pdf" multiple>
     <strong>Drop report PDFs here</strong>
-    <span>or click to browse &mdash; multiple files welcome, up to 25&nbsp;MB each</span>
+    <span>or click to browse &mdash; multiple files welcome, up to 125&nbsp;MB each</span>
   </label>
   {% if needs_password %}
   <div class="pwrow">
